@@ -23,15 +23,6 @@
       },
       "auto": true,
       "transport": "stdio",
-      "requires": {
-        "pip": [
-          "fastmcp",
-          "playwright"
-        ],
-        "system": [
-          "chromium"
-        ]
-      },
       "command": "${HUB_PYTHON}",
       "args": [
         "${HUB_ROOT}/mcp/browser-agent/server.py"
