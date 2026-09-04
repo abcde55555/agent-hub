@@ -3,3 +3,4 @@ secrets.env
 .ingest-backups/
 local.env
 __pycache__/
+.venv/

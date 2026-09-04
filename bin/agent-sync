@@ -1,0 +1,1125 @@
+#!/usr/bin/env python3
+"""agent-sync — deterministic config sync for coding agents.
+
+Single source of truth: the agent-hub at ~/.agents (git-tracked).
+Targets: claude (Claude Code), codex (OpenAI Codex CLI), agy (Antigravity),
+with dsh/opencode reading .agents/ natively (no generation needed).
+
+Commands:
+  init     create hub skeleton (vendors this script into hub/bin/)
+  scan     read-only inventory of hub + all agent configs
+  ingest   one-time adoption: gather scattered assets INTO the hub
+  apply    reconcile hub -> agent configs (symlinks + generated sections)
+  deps     check/install dependencies declared in servers.json requires
+           (--install: hub venv + pip, npm -g CLIs, playwright chromium)
+  doctor   verify: MCP initialize handshake, skill counts, memory links
+
+Design rules: idempotent; backup before overwrite; never touch unmanaged keys;
+LLMs do not author configs — this script does.
+
+stdlib only, Python 3.11+.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import tomllib
+import urllib.request
+import urllib.error
+from datetime import datetime
+from pathlib import Path
+
+# ---------------------------------------------------------------- paths
+
+HOME = Path.home()
+HUB = Path(os.environ.get("AGENT_SYNC_HUB", str(HOME / ".agents")))
+HUB_SKILLS = HUB / "skills"
+HUB_MCP = HUB / "mcp" / "servers.json"
+HUB_AGENTS_MD = HUB / "AGENTS.md"
+HUB_MANIFEST = HUB / "manifest.json"
+HUB_STATE = HUB / ".sync-state.json"
+HUB_GITIGNORE = HUB / ".gitignore"
+
+CLAUDE = HOME / ".claude"
+CLAUDE_JSON = HOME / ".claude.json"
+CLAUDE_SKILLS = CLAUDE / "skills"
+CLAUDE_MEM = CLAUDE / "CLAUDE.md"
+
+CODEX = HOME / ".codex"
+CODEX_CONFIG = CODEX / "config.toml"
+CODEX_SKILLS = CODEX / "skills"
+CODEX_MEM = CODEX / "AGENTS.md"
+
+AGY_CFG = HOME / ".gemini" / "config"
+AGY_MCP = AGY_CFG / "mcp_config.json"
+AGY_SKILLS = AGY_CFG / "skills"
+AGY_MEM = AGY_CFG / "AGENTS.md"
+
+DSH_SKILLS = HOME / ".dsh" / "skills"
+
+TOML_BEGIN = "# >>> agent-sync managed (regenerated; do not edit) >>>"
+TOML_END = "# <<< agent-sync managed <<<"
+
+DEFAULT_TARGETS = {"claude": True, "codex": True, "agy": True, "dsh": False, "opencode": True}
+
+# ---------------------------------------------------------------- output
+
+def ok(m):   print(f"  \033[32m✓\033[0m {m}")
+def warn(m): print(f"  \033[33m!\033[0m {m}")
+def fail(m): print(f"  \033[31m✗\033[0m {m}")
+def info(m): print(f"    {m}")
+def head(m): print(f"\n\033[1m{m}\033[0m")
+
+# ---------------------------------------------------------------- helpers
+
+def backup(p: Path) -> Path | None:
+    if not p.exists() and not p.is_symlink():
+        return None
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    bak = p.with_name(p.name + f".bak-{ts}")
+    shutil.copy2(p, bak, follow_symlinks=False)
+    return bak
+
+def read_json(p: Path, default=None):
+    try:
+        return json.loads(p.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return default
+
+def write_json(p: Path, data, dry=False):
+    if dry:
+        info(f"[dry-run] write {p}")
+        return
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+    tmp.replace(p)
+
+_LOCAL_ENV: dict | None = None
+
+def load_local_env() -> dict:
+    """Per-machine values captured at ingest (local.env/secrets.env, gitignored)."""
+    global _LOCAL_ENV
+    if _LOCAL_ENV is not None:
+        return _LOCAL_ENV
+    _LOCAL_ENV = {}
+    for fname in ("local.env", "secrets.env"):
+        p = HUB / fname
+        if not p.is_file():
+            continue
+        for line in p.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            _LOCAL_ENV[k.strip()] = v.strip().strip('"').strip("'")
+    return _LOCAL_ENV
+
+def expand_vars(s: str) -> str:
+    if not isinstance(s, str):
+        return s
+    local = load_local_env()
+    def repl(m):
+        k = m.group(1)
+        if k == "HUB_ROOT":
+            return str(HUB)
+        if k == "HUB_PYTHON":
+            return local.get("HUB_PYTHON") or sys.executable
+        if k in os.environ:
+            return os.environ[k]
+        if k in local:
+            return local[k]
+        return m.group(0)  # unset -> keep literal; doctor flags missing vars
+    return re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", repl, s)
+
+def save_local_env(updates: dict, dry=False):
+    if not updates:
+        return
+    p = HUB / "local.env"
+    have = {}
+    if p.is_file():
+        for line in p.read_text().splitlines():
+            if "=" in line and not line.strip().startswith("#"):
+                k, v = line.split("=", 1)
+                have[k.strip()] = v
+    for k, v in updates.items():
+        have.setdefault(k, v)  # local state is sticky; re-ingest never clobbers
+    if dry:
+        info(f"[dry-run] save {len(updates)} var(s) to {p} (gitignored)")
+        return
+    p.parent.mkdir(parents=True, exist_ok=True)
+    body = "# per-machine values captured at ingest; never commit\n" + \
+           "\n".join(f"{k}={v}" for k, v in sorted(have.items())) + "\n"
+    p.write_text(body)
+    os.chmod(p, 0o600)
+
+def ensure_symlink(link: Path, target: Path, dry=False) -> str:
+    """Create link -> target (absolute target stored as relative when possible)."""
+    rel = os.path.relpath(target, start=link.parent)
+    link.parent.mkdir(parents=True, exist_ok=True)
+    if link.is_symlink():
+        cur = os.readlink(link)
+        if os.path.realpath(link) == os.path.realpath(target):
+            return "unchanged"
+        if dry:
+            info(f"[dry-run] repoint {link} -> {rel}")
+            return "changed"
+        link.unlink()
+    elif link.exists():
+        if dry:
+            info(f"[dry-run] backup+replace {link} -> {rel}")
+            return "changed"
+        bak = backup(link)
+        if link.is_dir():
+            shutil.rmtree(link)
+        else:
+            link.unlink()
+        warn(f"{link} backed up to {bak.name} and replaced")
+    if dry:
+        info(f"[dry-run] symlink {link} -> {rel}")
+        return "created"
+    link.symlink_to(rel)
+    return "created"
+
+def load_hub_mcp():
+    data = read_json(HUB_MCP, default={"version": 1, "mcpServers": {}})
+    return data.get("mcpServers", {})
+
+def targets_of(spec):
+    t = dict(DEFAULT_TARGETS)
+    t.update(spec.get("targets") or {})
+    return t
+
+# ---------------------------------------------------------------- MCP spec conversion
+
+def claude_entry_from_hub(spec: dict) -> dict:
+    if spec.get("transport") in ("sse", "http"):
+        e = {"url": expand_vars(spec["url"]), "type": spec["transport"]}
+        if spec.get("headers"):
+            e["headers"] = {k: expand_vars(v) for k, v in spec["headers"].items()}
+        return e
+    e = {"type": "stdio", "command": expand_vars(spec["command"]),
+         "args": [expand_vars(a) for a in spec.get("args", [])]}
+    if spec.get("env"):
+        e["env"] = {k: expand_vars(str(v)) for k, v in spec["env"].items()}
+    return e
+
+def agy_entry_from_hub(spec: dict) -> tuple[dict | None, list[str]]:
+    notes = []
+    if spec.get("transport") in ("sse", "http"):
+        e = {"serverUrl": expand_vars(spec["url"])}
+        if spec.get("headers"):
+            notes.append("headers not supported in mcp_config.json (use `agy mcp add --header`)")
+        return e, notes
+    e = {"command": expand_vars(spec["command"]), "args": [expand_vars(a) for a in spec.get("args", [])]}
+    if spec.get("env"):
+        e["env"] = {k: expand_vars(str(v)) for k, v in spec["env"].items()}
+    return e, notes
+
+def toml_quote(s: str) -> str:
+    return json.dumps(str(s), ensure_ascii=False)
+
+def codex_toml_region(servers: dict) -> str:
+    lines = [TOML_BEGIN]
+    for name, spec in servers.items():
+        t = targets_of(spec)
+        if not t.get("codex"):
+            continue
+        key = toml_quote(name)
+        if spec.get("transport") in ("sse", "http"):
+            lines.append(f"[mcp_servers.{key}]")
+            lines.append(f"url = {toml_quote(expand_vars(spec['url']))}")
+            if spec.get("headers"):
+                lines.append(f"[mcp_servers.{key}.http_headers]")
+                for hk, hv in spec["headers"].items():
+                    lines.append(f"{toml_quote(hk)} = {toml_quote(expand_vars(hv))}")
+        else:
+            lines.append(f"[mcp_servers.{key}]")
+            lines.append(f"command = {toml_quote(expand_vars(spec['command']))}")
+            args = [expand_vars(a) for a in spec.get("args", [])]
+            lines.append("args = [" + ", ".join(toml_quote(a) for a in args) + "]")
+            env = spec.get("env") or {}
+            if env:
+                lines.append(f"[mcp_servers.{key}.env]")
+                for ek, ev in env.items():
+                    lines.append(f"{toml_quote(ek)} = {toml_quote(expand_vars(str(ev)))}")
+        lines.append("")
+    lines.append(TOML_END)
+    return "\n".join(lines)
+
+def strip_managed_region(text: str) -> str:
+    pat = re.compile(r"\n?" + re.escape(TOML_BEGIN) + r".*?" + re.escape(TOML_END) + r"\n?", re.S)
+    return pat.sub("\n", text).rstrip() + "\n"
+
+def toml_drop_server_blocks(text: str, names: list[str]) -> str:
+    """Remove [mcp_servers.<name>] tables (and subtables) for the given names."""
+    if not names:
+        return text
+    alts = "|".join('(?:"' + re.escape(n) + '"|' + re.escape(n) + r")(?:\.[^\]]*)?" for n in names)
+    header = re.compile(r"^\s*\[mcp_servers\.(?:" + alts + r")\]\s*$")
+    out, skipping = [], False
+    for line in text.splitlines(keepends=True):
+        if header.match(line):
+            skipping = True
+            continue
+        if skipping:
+            if line.lstrip().startswith("["):
+                skipping = False
+                out.append(line)
+            continue
+        out.append(line)
+    return "".join(out)
+
+# ---------------------------------------------------------------- scan
+
+def is_skill_dir(p: Path) -> bool:
+    return p.is_dir() and (p / "SKILL.md").exists()
+
+def count_skills(root: Path) -> int:
+    if not root.is_dir():
+        return 0
+    n = 0
+    for child in root.iterdir():
+        if child.name.startswith("."):
+            continue
+        if is_skill_dir(child):
+            n += 1
+    return n
+
+def cmd_scan(_args):
+    head("hub")
+    if HUB.exists():
+        ok(f"hub at {HUB}")
+        info(f"skills: {count_skills(HUB_SKILLS)}  | AGENTS.md: {'yes' if HUB_AGENTS_MD.exists() else 'no'}  | MCP servers: {len(load_hub_mcp())}")
+    else:
+        warn(f"hub not initialized ({HUB}) — run `agent-sync init` then `ingest`")
+
+    head("global MCP servers per agent")
+    cj = read_json(CLAUDE_JSON, default={})
+    info(f"claude  ~/.claude.json mcpServers : {sorted((cj.get('mcpServers') or {}).keys())}")
+    if CODEX_CONFIG.exists():
+        try:
+            cod = tomllib.loads(CODEX_CONFIG.read_text())
+            info(f"codex   config.toml [mcp_servers] : {sorted((cod.get('mcp_servers') or {}).keys())}")
+        except tomllib.TOMLDecodeError as e:
+            fail(f"codex config.toml parse error: {e}")
+    aj = read_json(AGY_MCP, default={})
+    info(f"agy     mcp_config.json           : {sorted((aj.get('mcpServers') or {}).keys())}")
+
+    head("skill roots")
+    for label, root in [("hub     ~/.agents/skills", HUB_SKILLS),
+                        ("claude  ~/.claude/skills", CLAUDE_SKILLS),
+                        ("codex   ~/.codex/skills (excl .system)", CODEX_SKILLS),
+                        ("agy     ~/.gemini/config/skills", AGY_SKILLS),
+                        ("dsh     ~/.dsh/skills", DSH_SKILLS)]:
+        n = count_skills(root)
+        note = ""
+        if label.startswith("codex") and (CODEX_SKILLS / ".system").exists():
+            n = max(0, n)  # .system is not counted (starts with '.')
+        info(f"{label}: {n} skill(s)  [{root}]")
+
+    head("memory files")
+    for label, p in [("claude CLAUDE.md", CLAUDE_MEM), ("codex AGENTS.md", CODEX_MEM), ("agy AGENTS.md", AGY_MEM)]:
+        if p.is_symlink():
+            info(f"{label}: symlink -> {os.readlink(p)}")
+        elif p.exists():
+            info(f"{label}: real file ({p.stat().st_size} bytes)")
+        else:
+            info(f"{label}: missing")
+
+    head("project-level skill bundles (not moved by ingest; native .agents discovery)")
+    code_root = HOME / "Desktop" / "Code"
+    if code_root.is_dir():
+        for proj in sorted(code_root.iterdir()):
+            pa = proj / ".agents" / "skills"
+            pc = proj / ".claude" / "skills"
+            na = count_skills(pa)
+            nc = count_skills(pc)
+            if na or nc:
+                info(f"{proj.name}: .agents/skills={na}  .claude/skills={nc}")
+
+# ---------------------------------------------------------------- init / ingest
+
+def cmd_init(args):
+    dry = args.dry_run
+    head(f"init hub at {HUB}")
+    for d in [HUB, HUB_SKILLS, HUB / "mcp", HUB / "prompts", HUB / "agents", HUB / "hooks", HUB / "overlays"]:
+        if dry:
+            info(f"[dry-run] mkdir {d}")
+        else:
+            d.mkdir(parents=True, exist_ok=True)
+    if not dry:
+        required = ["secrets.env", "local.env", ".sync-state.json", ".ingest-backups/",
+                    "__pycache__/", ".venv/"]
+        have = HUB_GITIGNORE.read_text().splitlines() if HUB_GITIGNORE.exists() else []
+        missing = [l for l in required if l not in have]
+        if missing:
+            HUB_GITIGNORE.write_text("\n".join(have + missing) + "\n")
+        # vendor this script into the hub so a cloned hub is self-bootstrapping
+        self = Path(__file__).resolve()
+        hub_bin = HUB / "bin"
+        hub_bin.mkdir(parents=True, exist_ok=True)
+        dest = hub_bin / "agent-sync"
+        try:
+            same = dest.exists() and dest.samefile(self)
+        except OSError:
+            same = False
+        if not same:
+            shutil.copy2(self, dest)
+            dest.chmod(0o755)
+            ok(f"vendored agent-sync -> {dest}")
+    ok("hub skeleton ready")
+
+PROXY_KEYS = {"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"}
+PIP_FROM_IMPORT = {"fastmcp": "fastmcp", "mcp": "mcp", "playwright": "playwright",
+                   "httpx": "httpx", "requests": "requests"}
+SYS_FROM_PIP = {"playwright": ["chromium"]}
+SECRET_KEY_HINT = re.compile(r"token|key|secret|password|auth", re.I)
+
+def gather_local_scripts(entry_py: Path, dest_dir: Path) -> set[str]:
+    """Copy entry script + sibling .py modules it imports into dest_dir."""
+    copied: set[str] = set()
+    def walk(py: Path):
+        if py.name in copied or not py.is_file():
+            return
+        dst = dest_dir / py.name
+        if dst.exists() and os.path.samefile(py, dst):
+            copied.add(py.name)  # already gathered in hub (e.g. re-ingest)
+            return
+        copied.add(py.name)
+        shutil.copy2(py, dst)
+        text = py.read_text(errors="ignore")
+        for mod in re.findall(r"^\s*(?:from|import)\s+([a-zA-Z_]\w*)", text, re.M):
+            sib = py.parent / (mod + ".py")
+            if sib.is_file():
+                walk(sib)
+    walk(entry_py)
+    return copied
+
+def detect_pip_requires(d: Path) -> dict:
+    pkgs, sysdeps = set(), set()
+    for py in d.glob("*.py"):
+        text = py.read_text(errors="ignore")
+        for mod in re.findall(r"^\s*(?:from|import)\s+([a-zA-Z_]\w*)", text, re.M):
+            if mod in PIP_FROM_IMPORT:
+                pkgs.add(PIP_FROM_IMPORT[mod])
+                for s in SYS_FROM_PIP.get(mod, []):
+                    sysdeps.add(s)
+    req = {}
+    if pkgs:
+        req["pip"] = sorted(pkgs)
+    if sysdeps:
+        req["system"] = sorted(sysdeps)
+    return req
+
+def hub_mcp_from_claude(claude_mcp: dict, dry: bool) -> tuple[dict, list[str], dict]:
+    out, notes, captured = {}, [], {}
+    for name, e in claude_mcp.items():
+        spec = {"targets": dict(DEFAULT_TARGETS), "auto": True}
+        if e.get("url"):
+            spec["transport"] = e.get("type", "http")
+            spec["url"] = e["url"]
+            if e.get("headers"):
+                spec["headers"] = e["headers"]
+        else:
+            spec["transport"] = "stdio"
+            cmd = e.get("command", "")
+            args = list(e.get("args", []) or [])
+            base = os.path.basename(cmd)
+            # python interpreter -> variable; remember the interpreter that worked
+            if base in ("python3", "python"):
+                if cmd.startswith("/"):
+                    captured["HUB_PYTHON"] = cmd
+                cmd = "${HUB_PYTHON}"
+            # local script files -> gather into hub, reference via ${HUB_ROOT}
+            new_args = []
+            for a in args:
+                ap = Path(a)
+                if a.startswith("/") and ap.is_file() and ap.suffix == ".py":
+                    dest_dir = HUB / "mcp" / name
+                    try:
+                        in_hub = str(ap.resolve()).startswith(str(HUB.resolve()) + "/")
+                    except OSError:
+                        in_hub = False
+                    rel = f"${{HUB_ROOT}}/mcp/{name}/{ap.name}"
+                    if in_hub:
+                        new_args.append(rel)  # already hub-resident; just variablize
+                        continue
+                    if dry:
+                        notes.append(f"[dry-run] would gather {ap} (+sibling imports) -> {dest_dir}")
+                    else:
+                        dest_dir.mkdir(parents=True, exist_ok=True)
+                        files = gather_local_scripts(ap, dest_dir)
+                        req = detect_pip_requires(dest_dir)
+                        if req:
+                            spec.setdefault("requires", {}).update(req)
+                        notes.append(f"gathered {len(files)} script(s) into hub mcp/{name}/: {sorted(files)}")
+                    new_args.append(rel)
+                else:
+                    new_args.append(a)
+            spec["command"] = cmd
+            spec["args"] = new_args
+            # env: machine-specific values become ${VAR} references
+            env = dict(e.get("env") or {})
+            for k, v in list(env.items()):
+                if k in PROXY_KEYS:
+                    env[k] = "${" + k + "}"
+                    if isinstance(v, str):
+                        captured[k] = v  # always persist per-machine network facts
+                    notes.append(f"{name}: env {k} -> ${{{k}}} reference (per-machine)")
+                elif isinstance(v, str) and os.environ.get(k) == v:
+                    env[k] = "${" + k + "}"
+                    notes.append(f"{name}: env {k} matches ambient -> ${{{k}}} reference")
+                elif isinstance(v, str) and SECRET_KEY_HINT.search(k):
+                    captured[k] = v
+                    env[k] = "${" + k + "}"
+                    notes.append(f"{name}: env {k} looks secret -> ${{{k}}} ref, value kept in gitignored local.env")
+            if env:
+                spec["env"] = env
+            if base and base not in ("npx", "node", "uvx", "uv", "docker", "python3", "python"):
+                req = spec.setdefault("requires", {})
+                req.setdefault("bins", []).append(base)
+                pkg = detect_npm_package(base)
+                if pkg:
+                    req.setdefault("npm", []).append(pkg)
+                    notes.append(f"{name}: binary {base} resolves to npm package {pkg}")
+        out[name] = spec
+    return out, notes, captured
+
+def detect_npm_package(bin_name: str) -> str | None:
+    """If a CLI binary is a symlink into an npm global install, return the package name."""
+    path = shutil.which(bin_name)
+    if not path:
+        return None
+    real = os.path.realpath(path)
+    m = re.search(r"node_modules/((?:@[^/]+/)?[^/]+)/", real)
+    return m.group(1) if m else None
+
+def cmd_ingest(args):
+    dry = args.dry_run
+    cmd_init(args)
+    head("ingest: global memory (CLAUDE.md -> hub AGENTS.md)")
+    if HUB_AGENTS_MD.exists():
+        warn("hub AGENTS.md already exists, leaving as-is")
+    elif CLAUDE_MEM.exists() and not CLAUDE_MEM.is_symlink():
+        if dry:
+            info(f"[dry-run] copy {CLAUDE_MEM} -> {HUB_AGENTS_MD}")
+        else:
+            shutil.copy2(CLAUDE_MEM, HUB_AGENTS_MD)
+        ok(f"adopted global memory ({CLAUDE_MEM.stat().st_size} bytes); apply will relink claude to hub")
+    elif CLAUDE_MEM.is_symlink():
+        warn("claude CLAUDE.md already a symlink — assumed managed")
+    else:
+        warn("no global CLAUDE.md found")
+
+    head("ingest: MCP servers (~/.claude.json -> hub mcp/servers.json)")
+    if HUB_MCP.exists():
+        warn("hub servers.json already exists, leaving as-is (edit manually to add/change)")
+    else:
+        cj = read_json(CLAUDE_JSON, default={})
+        servers, mcp_notes, captured_env = hub_mcp_from_claude(cj.get("mcpServers") or {}, dry)
+        if captured_env:
+            save_local_env(captured_env, dry=dry)
+            info(f"captured {len(captured_env)} per-machine env value(s) -> local.env (gitignored, chmod 600)")
+        for name, spec in servers.items():
+            kind = spec["transport"]
+            desc = spec.get("url") or f"{spec.get('command')} {' '.join(spec.get('args', []))}".strip()
+            ok(f"{name} ({kind}): {desc[:90]}")
+            for rk, rv in (spec.get("requires") or {}).items():
+                info(f"requires {rk}: {rv}")
+        for n in mcp_notes:
+            info(n)
+        if not dry:
+            write_json(HUB_MCP, {"version": 1, "mcpServers": servers})
+
+    head("ingest: promote global skills into hub (move + symlink back)")
+    promoted, skipped = [], []
+    existing = {p.name for p in HUB_SKILLS.iterdir()} if HUB_SKILLS.is_dir() else set()
+    for src_root in [DSH_SKILLS, CLAUDE_SKILLS]:
+        if not src_root.is_dir():
+            continue
+        for item in sorted(src_root.iterdir()):
+            if item.name.startswith(".") or item.name == "README.md":
+                continue
+            if not is_skill_dir(item):
+                skipped.append(f"{item} (no SKILL.md — flat file or unsupported layout)")
+                continue
+            dest = HUB_SKILLS / item.name
+            if item.name in existing or dest.exists():
+                skipped.append(f"{item} (already in hub)")
+                continue
+            if dry:
+                info(f"[dry-run] move {item} -> {dest}; symlink back")
+                promoted.append(item.name)
+                continue
+            shutil.move(str(item), str(dest))
+            rel = os.path.relpath(dest, start=item.parent)
+            item.symlink_to(rel)
+            promoted.append(item.name)
+    for n in promoted:
+        ok(n)
+    for s in skipped:
+        warn(s)
+
+    head("ingest: manifest + git")
+    skills = sorted(p.name for p in HUB_SKILLS.iterdir() if is_skill_dir(p)) if HUB_SKILLS.is_dir() else []
+    if not dry:
+        write_json(HUB_MANIFEST, {
+            "version": 1,
+            "generatedAt": datetime.now().isoformat(timespec="seconds"),
+            "skills": skills,
+            "mcpServers": sorted(load_hub_mcp().keys()),
+            "note": "targets/requires live in mcp/servers.json; edit there then run `agent-sync apply`",
+        })
+        if shutil.which("git"):
+            if not (HUB / ".git").exists():
+                subprocess.run(["git", "init", "-q"], cwd=HUB, check=False)
+            subprocess.run(["git", "add", "-A"], cwd=HUB, check=False,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            r = subprocess.run(["git", "commit", "-q", "-m", "agent-hub: ingest via agent-sync"],
+                               cwd=HUB, check=False, capture_output=True)
+            if r.returncode == 0:
+                ok("committed to hub git")
+            else:
+                info("git commit skipped (nothing new or git unavailable)")
+    skill_n = count_skills(HUB_SKILLS) + (len(promoted) if dry else 0)
+    mcp_n = len(load_hub_mcp())
+    if dry and not HUB_MCP.exists():
+        mcp_n = len((read_json(CLAUDE_JSON, default={}) or {}).get("mcpServers") or {})
+    ok(f"ingest done: {skill_n} skills, {mcp_n} MCP servers in hub")
+
+# ---------------------------------------------------------------- apply
+
+def apply_skills(dry, targets):
+    head("apply: skills -> symlinks")
+    if not HUB_SKILLS.is_dir():
+        warn("no hub skills dir")
+        return
+    plans = []
+    if targets.get("claude"):
+        plans.append(("claude", CLAUDE_SKILLS))
+    if targets.get("codex"):
+        plans.append(("codex", CODEX_SKILLS))
+    if targets.get("agy"):
+        plans.append(("agy", AGY_SKILLS))
+    for label, link_dir in plans:
+        n_created = n_unchanged = 0
+        for skill_dir in sorted(HUB_SKILLS.iterdir()):
+            if not is_skill_dir(skill_dir):
+                continue
+            r = ensure_symlink(link_dir / skill_dir.name, skill_dir, dry=dry)
+            if r == "created":
+                n_created += 1
+            elif r == "unchanged":
+                n_unchanged += 1
+        ok(f"{label}: {link_dir}  (+{n_created} new, {n_unchanged} current)")
+    info("dsh/opencode discover ~/.agents/skills natively — no links needed")
+
+def apply_memory(dry, targets):
+    head("apply: global memory -> symlinks")
+    if not HUB_AGENTS_MD.exists():
+        warn("hub AGENTS.md missing — skip memory links")
+        return
+    plans = []
+    if targets.get("claude"):
+        plans.append(("claude", CLAUDE_MEM))
+    if targets.get("codex"):
+        plans.append(("codex", CODEX_MEM))
+    if targets.get("agy"):
+        plans.append(("agy", AGY_MEM))
+    for label, link in plans:
+        r = ensure_symlink(link, HUB_AGENTS_MD, dry=dry)
+        ok(f"{label}: {link} ({r})")
+
+def apply_mcp_claude(servers: dict, dry) -> set:
+    head("apply: MCP -> claude ~/.claude.json (merge)")
+    managed = set()
+    dirty = False
+    cj = read_json(CLAUDE_JSON, default={})
+    mcp = cj.setdefault("mcpServers", {})
+    for name, spec in servers.items():
+        if not targets_of(spec).get("claude"):
+            continue
+        want = claude_entry_from_hub(spec)
+        managed.add(name)
+        if mcp.get(name) == want:
+            ok(f"{name}: current")
+        else:
+            dirty = True
+            if not dry:
+                mcp[name] = want
+            ok(f"{name}: {'would write' if dry else 'written'}")
+    if not dry and dirty:
+        bak = backup(CLAUDE_JSON)
+        write_json(CLAUDE_JSON, cj)
+        if bak:
+            info(f"backup: {bak.name}")
+    return managed
+
+def apply_mcp_codex(servers: dict, dry) -> set:
+    head("apply: MCP -> codex config.toml (managed region)")
+    managed = set()
+    raw = CODEX_CONFIG.read_text() if CODEX_CONFIG.exists() else ""
+    try:
+        existing = tomllib.loads(strip_managed_region(raw)).get("mcp_servers") or {}
+    except tomllib.TOMLDecodeError as e:
+        fail(f"config.toml parse error, aborting codex MCP: {e}")
+        return managed
+    wanted = {}
+    absorbed = []
+    for name, spec in servers.items():
+        if not targets_of(spec).get("codex"):
+            continue
+        managed.add(name)
+        if name in existing:
+            # same-name unmanaged entry: absorb into managed region (hub is SSOT),
+            # preserving any extra env/header keys it had that hub doesn't know.
+            ex = existing[name] if isinstance(existing[name], dict) else {}
+            eff = json.loads(json.dumps(spec))  # deep copy
+            if ex.get("env"):
+                eff["env"] = {**ex["env"], **(eff.get("env") or {})}
+            if ex.get("http_headers"):
+                eff["headers"] = {**ex["http_headers"], **(eff.get("headers") or {})}
+            wanted[name] = eff
+            absorbed.append(name)
+            warn(f"{name}: absorbing pre-existing unmanaged entry into managed region (backup saved)")
+            continue
+        wanted[name] = spec
+    new_text = strip_managed_region(toml_drop_server_blocks(raw, absorbed))
+    region = codex_toml_region(wanted)
+    if wanted:
+        new_text = new_text.rstrip() + "\n\n" + region + "\n"
+    if dry:
+        info(f"[dry-run] rewrite {CODEX_CONFIG} managed region ({len(wanted)} servers)")
+    elif new_text == raw:
+        ok("config.toml: current")
+    else:
+        try:
+            tomllib.loads(new_text)  # self-check before touching disk
+        except tomllib.TOMLDecodeError as e:
+            fail(f"generated TOML invalid ({e}); not writing")
+            return managed
+        if CODEX_CONFIG.exists():
+            bak = backup(CODEX_CONFIG)
+            info(f"backup: {bak.name}")
+        CODEX_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+        CODEX_CONFIG.write_text(new_text)
+    ok(f"codex managed region: {len(wanted)} server(s)")
+    return managed
+
+def apply_mcp_agy(servers: dict, state: dict, dry) -> set:
+    head("apply: MCP -> agy ~/.gemini/config/mcp_config.json (merge)")
+    managed = set()
+    dirty = False
+    cfg = read_json(AGY_MCP, default={}) or {}
+    mcp = cfg.setdefault("mcpServers", {})
+    prev = set((state.get("agyManagedMcp") or []))
+    for name, spec in servers.items():
+        if not targets_of(spec).get("agy"):
+            continue
+        entry, notes = agy_entry_from_hub(spec)
+        managed.add(name)
+        for note in notes:
+            warn(f"{name}: {note}")
+        if entry is None:
+            continue
+        if mcp.get(name) == entry:
+            ok(f"{name}: current")
+        else:
+            dirty = True
+            if not dry:
+                mcp[name] = entry
+            ok(f"{name}: {'would write' if dry else 'written'}")
+    # remove servers we previously managed but hub no longer targets
+    for gone in prev - managed:
+        if gone in mcp:
+            dirty = True
+            if not dry:
+                mcp.pop(gone, None)
+            warn(f"{gone}: removed (no longer in hub targets)")
+    if not dry and dirty:
+        AGY_MCP.parent.mkdir(parents=True, exist_ok=True)
+        if AGY_MCP.exists() and AGY_MCP.stat().st_size > 0:
+            bak = backup(AGY_MCP)
+            info(f"backup: {bak.name}")
+        write_json(AGY_MCP, cfg)
+    return managed
+
+def cmd_apply(args):
+    dry = args.dry_run
+    if not HUB.exists():
+        fail("hub not initialized — run `agent-sync ingest` first")
+        sys.exit(1)
+    if not HUB_MCP.is_file():
+        fail("hub mcp/servers.json missing — refusing to run against empty state")
+        sys.exit(1)
+    servers = load_hub_mcp()
+    targets = dict(DEFAULT_TARGETS)
+    if args.targets:
+        targets = {k: (k in args.targets.split(",")) for k in DEFAULT_TARGETS}
+    if dry:
+        head("DRY RUN — no changes will be written")
+
+    apply_skills(dry, targets)
+    apply_memory(dry, targets)
+    state = read_json(HUB_STATE, default={}) or {}
+    claude_managed = apply_mcp_claude(servers, dry) if targets.get("claude") else set()
+    codex_managed = apply_mcp_codex(servers, dry) if targets.get("codex") else set()
+    agy_managed = apply_mcp_agy(servers, state, dry) if targets.get("agy") else set()
+
+    if not dry:
+        state.update({
+            "updatedAt": datetime.now().isoformat(timespec="seconds"),
+            "claudeManagedMcp": sorted(claude_managed),
+            "codexManagedMcp": sorted(codex_managed),
+            "agyManagedMcp": sorted(agy_managed),
+        })
+        write_json(HUB_STATE, state)
+        ok(f"state recorded: {HUB_STATE}")
+    head("done")
+    info("restart running agent sessions to pick up new configs; then run `agent-sync doctor`")
+
+# ---------------------------------------------------------------- deps
+
+PIP_IMPORT_NAME = {"fastmcp": "fastmcp", "playwright": "playwright", "mcp": "mcp",
+                   "httpx": "httpx", "requests": "requests"}
+
+def run_cmd(cmd: list[str], timeout=600, capture=True) -> tuple[bool, str]:
+    try:
+        r = subprocess.run(cmd, capture_output=capture, text=True, timeout=timeout)
+        out = (r.stdout or "") + (r.stderr or "")
+        return r.returncode == 0, out
+    except subprocess.TimeoutExpired:
+        return False, "timeout"
+    except FileNotFoundError as e:
+        return False, str(e)
+
+def python_imports_ok(py: str, mods: list[str]) -> bool:
+    code = "import importlib.util,sys; sys.exit(0 if all(importlib.util.find_spec(m) for m in %r) else 1)" % mods
+    r = subprocess.run([py, "-c", code], capture_output=True)
+    return r.returncode == 0
+
+def chromium_present() -> bool:
+    cache = HOME / ".cache" / "ms-playwright"
+    if cache.is_dir() and any(cache.glob("chromium-*")):
+        return True
+    return bool(shutil.which("chromium") or shutil.which("chromium-browser")
+                or shutil.which("google-chrome"))
+
+def cmd_deps(args):
+    install = args.install
+    dry = args.dry_run
+    if not HUB_MCP.is_file():
+        fail("hub mcp/servers.json missing — run `ingest` first")
+        sys.exit(1)
+    servers = load_hub_mcp()
+    local = load_local_env()
+    issues = 0
+
+    # gather requirements across all servers
+    pip_pkgs, bins, sysdeps = set(), set(), set()
+    npm_for_bin: dict[str, str] = {}  # binary -> npm package (lockstep at ingest)
+    for name, spec in servers.items():
+        req = spec.get("requires") or {}
+        rbins = req.get("bins") or []
+        rnpm = req.get("npm") or []
+        pip_pkgs.update(req.get("pip") or [])
+        bins.update(rbins)
+        sysdeps.update(req.get("system") or [])
+        for b, p in zip(rbins, rnpm):
+            npm_for_bin[b] = p
+
+    # env vars referenced by specs (values, headers, urls)
+    var_refs = set()
+    for spec in servers.values():
+        for container in (spec.get("env") or {}, spec.get("headers") or {}):
+            for v in container.values():
+                if isinstance(v, str):
+                    var_refs.update(k for k in re.findall(r"\$\{([A-Za-z_]\w*)\}", v)
+                                    if k not in ("HUB_ROOT", "HUB_PYTHON"))
+        if isinstance(spec.get("url"), str):
+            var_refs.update(k for k in re.findall(r"\$\{([A-Za-z_]\w*)\}", spec["url"])
+                            if k not in ("HUB_ROOT", "HUB_PYTHON"))
+
+    head("deps: python runtime")
+    venv_py = HUB / ".venv" / "bin" / "python"
+    hub_py = local.get("HUB_PYTHON")
+    mods = sorted({PIP_IMPORT_NAME.get(p, p) for p in pip_pkgs})
+    if hub_py and Path(hub_py).is_file():
+        if not mods or python_imports_ok(hub_py, mods):
+            ok(f"HUB_PYTHON={hub_py} has all required packages")
+        elif install and not dry:
+            warn(f"{hub_py} missing {mods}; installing via pip")
+            good, out = run_cmd([hub_py, "-m", "pip", "install", *sorted(pip_pkgs)], timeout=900)
+            (ok if good else fail)(f"pip install into {hub_py}: {'done' if good else 'FAILED — ' + out[-300:]}")
+            issues += 0 if good else 1
+        else:
+            fail(f"HUB_PYTHON={hub_py} missing modules {mods} (run with --install)")
+            issues += 1
+    elif install and not dry:
+        info(f"no HUB_PYTHON configured; creating hub venv at {venv_py}")
+        good, out = run_cmd([sys.executable, "-m", "venv", str(HUB / ".venv")], timeout=300)
+        if not good:
+            fail(f"venv creation failed: {out[-300:]}")
+            issues += 1
+        else:
+            run_cmd([str(venv_py), "-m", "pip", "install", "--upgrade", "pip"], timeout=600)
+            good, out = run_cmd([str(venv_py), "-m", "pip", "install", *sorted(pip_pkgs)], timeout=1200)
+            if good:
+                save_local_env({"HUB_PYTHON": str(venv_py)})
+                ok(f"venv ready with {sorted(pip_pkgs)}; HUB_PYTHON saved to local.env (run `apply` next)")
+            else:
+                fail(f"pip install in venv failed: {out[-300:]}")
+                issues += 1
+    else:
+        warn(f"no HUB_PYTHON in local.env (run with --install to create {venv_py})")
+        issues += 1
+    eff_py = hub_py or str(venv_py)
+
+    head("deps: pip packages")
+    if not pip_pkgs:
+        info("none declared")
+    for p in sorted(pip_pkgs):
+        mod = PIP_IMPORT_NAME.get(p, p)
+        have = Path(eff_py).is_file() and python_imports_ok(eff_py, [mod])
+        (ok if have else fail)(f"{p} (import {mod}): {'installed' if have else 'MISSING'}")
+        if not have:
+            issues += 1
+
+    head("deps: CLI binaries")
+    for b in sorted(bins):
+        path = shutil.which(b)
+        if path:
+            ok(f"{b}: {path}")
+            continue
+        pkg = npm_for_bin.get(b)
+        if pkg and shutil.which("npm"):
+            if install and not dry:
+                warn(f"{b} missing; installing npm package {pkg} globally")
+                good, out = run_cmd(["npm", "install", "-g", pkg], timeout=900)
+                (ok if good else fail)(f"npm i -g {pkg}: {'done' if good else 'FAILED — ' + out[-300:]}")
+                issues += 0 if good else 1
+            else:
+                fail(f"{b}: MISSING (auto-fix: npm install -g {pkg}; run with --install)")
+                issues += 1
+        else:
+            fail(f"{b}: MISSING (no automatic install source known)")
+            issues += 1
+
+    head("deps: system packages")
+    for s in sorted(sysdeps):
+        if s == "chromium":
+            have = chromium_present()
+            if have:
+                ok("chromium: found (playwright cache or system)")
+            elif install and not dry and Path(eff_py).is_file() and python_imports_ok(eff_py, ["playwright"]):
+                warn("chromium missing; running `playwright install chromium` (large download)")
+                good, out = run_cmd([eff_py, "-m", "playwright", "install", "chromium"], timeout=1800)
+                (ok if good else fail)(f"playwright install chromium: {'done' if good else 'FAILED — ' + out[-300:]}")
+                issues += 0 if good else 1
+            else:
+                fail("chromium: MISSING (auto-fix: <HUB_PYTHON> -m playwright install chromium)")
+                issues += 1
+        else:
+            warn(f"{s}: no automatic check/install implemented")
+
+    head("deps: referenced environment variables")
+    if not var_refs:
+        info("none referenced")
+    for v in sorted(var_refs):
+        if os.environ.get(v) or v in local:
+            ok(f"${{{v}}}: set")
+        else:
+            fail(f"${{{v}}}: MISSING — needs you")
+            info(f"fix: echo '{v}=<value>' >> {HUB}/local.env   # chmod 600, never commit")
+            issues += 1
+
+    head(f"deps result: {'ALL SATISFIED' if issues == 0 else f'{issues} issue(s)' + (' — see NEEDS YOU above' if any(not (os.environ.get(v) or v in local) for v in var_refs) else '')}")
+    sys.exit(1 if issues else 0)
+
+# ---------------------------------------------------------------- doctor
+
+def mcp_handshake_stdio(spec: dict, timeout=12) -> tuple[bool, str]:
+    cmd = expand_vars(spec["command"])
+    args = [expand_vars(a) for a in spec.get("args", [])]
+    env = dict(os.environ)
+    for k, v in (spec.get("env") or {}).items():
+        env[k] = expand_vars(str(v))
+    try:
+        p = subprocess.Popen([cmd, *args], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, env=env)
+    except FileNotFoundError:
+        return False, f"command not found: {cmd}"
+    msg = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                      "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                                 "clientInfo": {"name": "agent-sync-doctor", "version": "0.1"}}})
+    try:
+        assert p.stdin and p.stdout
+        p.stdin.write((msg + "\n").encode())
+        p.stdin.flush()
+        import selectors
+        sel = selectors.DefaultSelector()
+        sel.register(p.stdout, selectors.EVENT_READ)
+        deadline = time.time() + timeout
+        buf = b""
+        while time.time() < deadline:
+            for _key, _ev in sel.select(timeout=0.5):
+                chunk = p.stdout.read1(65536) if hasattr(p.stdout, "read1") else p.stdout.readline()
+                if not chunk:
+                    break
+                buf += chunk
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        d = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if d.get("id") == 1:
+                        return True, "initialize OK"
+        return False, f"timeout after {timeout}s (no initialize response)"
+    except Exception as e:
+        return False, f"error: {e}"
+    finally:
+        try:
+            p.terminate()
+            p.wait(timeout=3)
+        except Exception:
+            p.kill()
+
+def mcp_check_remote(spec: dict, timeout=10) -> tuple[bool, str]:
+    url = spec["url"]
+    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                       "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                                  "clientInfo": {"name": "agent-sync-doctor", "version": "0.1"}}}).encode()
+    headers = {"Content-Type": "application/json"}
+    for k, v in (spec.get("headers") or {}).items():
+        headers[k] = expand_vars(str(v))
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return True, f"reachable (HTTP {r.status})"
+    except urllib.error.HTTPError as e:
+        return True, f"reachable (HTTP {e.code})"  # server answered; auth/protocol handled by agent
+    except urllib.error.URLError as e:
+        return False, f"unreachable: {e.reason}"
+    except Exception as e:
+        return False, f"error: {e}"
+
+def cmd_doctor(_args):
+    head("agent-sync doctor")
+    if not HUB.exists():
+        fail("hub not initialized — run `agent-sync ingest` first")
+        sys.exit(1)
+    if not HUB_MCP.is_file():
+        fail("hub mcp/servers.json missing — refusing to run against empty state")
+        sys.exit(1)
+    servers = load_hub_mcp()
+    hub_skill_n = count_skills(HUB_SKILLS)
+    failures = 0
+
+    head("MCP servers (initialize handshake)")
+    handshakes = {}
+    for name, spec in servers.items():
+        if spec.get("transport") in ("sse", "http"):
+            ok_, msg = mcp_check_remote(spec)
+        else:
+            ok_, msg = mcp_handshake_stdio(spec)
+        handshakes[name] = ok_
+        (ok if ok_ else fail)(f"{name} [{spec.get('transport')}]: {msg}")
+        if not ok_:
+            failures += 1
+
+    head("config presence per agent")
+    cj = read_json(CLAUDE_JSON, default={})
+    claude_mcp = set((cj.get("mcpServers") or {}).keys())
+    try:
+        cod = tomllib.loads(CODEX_CONFIG.read_text()) if CODEX_CONFIG.exists() else {}
+        codex_mcp = set((cod.get("mcp_servers") or {}).keys())
+    except tomllib.TOMLDecodeError:
+        codex_mcp = set()
+        fail("codex config.toml unparsable")
+        failures += 1
+    agy_mcp = set(((read_json(AGY_MCP, default={}) or {}).get("mcpServers") or {}).keys())
+
+    rows = []
+    for agent, present in [("claude", claude_mcp), ("codex", codex_mcp), ("agy", agy_mcp)]:
+        for name, spec in servers.items():
+            t = targets_of(spec)
+            if not t.get(agent):
+                continue
+            if name not in present:
+                rows.append((agent, name, "MCP", "missing in config"))
+                failures += 1
+            elif not handshakes.get(name):
+                rows.append((agent, name, "MCP", "present, handshake FAILED"))
+            else:
+                rows.append((agent, name, "MCP", "present + handshake ok"))
+    for agent, name, kind, status in rows:
+        mark = "✓" if "ok" in status else ("✗" if "FAILED" in status or "missing" in status else "!")
+        color = "\033[32m" if mark == "✓" else "\033[31m"
+        print(f"  {color}{mark}\033[0m {agent:7s} {kind:4s} {name:16s} {status}")
+
+    head("skills discovery (count vs hub)")
+    expected = hub_skill_n
+    for label, root in [("claude ~/.claude/skills", CLAUDE_SKILLS),
+                        ("codex  ~/.codex/skills", CODEX_SKILLS),
+                        ("agy    ~/.gemini/config/skills", AGY_SKILLS),
+                        ("dsh/opencode read hub natively", HUB_SKILLS)]:
+        n = count_skills(root)
+        good = (n >= expected) if "dsh" not in label else (n == expected)
+        (ok if good else warn)(f"{label}: {n} skill(s) (hub has {expected})")
+        if not good:
+            failures += 1
+
+    head("global memory links")
+    for label, p in [("claude ~/.claude/CLAUDE.md", CLAUDE_MEM),
+                     ("codex  ~/.codex/AGENTS.md", CODEX_MEM),
+                     ("agy    ~/.gemini/config/AGENTS.md", AGY_MEM)]:
+        if p.is_symlink():
+            tgt = Path(os.readlink(p))
+            if not tgt.is_absolute():
+                tgt = p.parent / tgt
+            if tgt.exists():
+                ok(f"{label} -> {os.readlink(p)}")
+            else:
+                fail(f"{label}: broken symlink -> {os.readlink(p)}")
+                failures += 1
+        elif p.exists():
+            warn(f"{label}: real file (not linked to hub) — run apply")
+            failures += 1
+        else:
+            fail(f"{label}: missing")
+            failures += 1
+
+    head(f"result: {'ALL GREEN' if failures == 0 else f'{failures} issue(s)'}")
+    sys.exit(1 if failures else 0)
+
+# ---------------------------------------------------------------- cli
+
+def main():
+    ap = argparse.ArgumentParser(prog="agent-sync", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    for name in ("init", "scan", "ingest", "apply", "deps", "doctor"):
+        p = sub.add_parser(name)
+        p.add_argument("--dry-run", action="store_true")
+        if name == "apply":
+            p.add_argument("--targets", help="comma list: claude,codex,agy")
+        if name == "deps":
+            p.add_argument("--install", action="store_true",
+                           help="create hub venv / pip install / npm -g / playwright install")
+    args = ap.parse_args()
+    {"init": cmd_init, "scan": cmd_scan, "ingest": cmd_ingest,
+     "apply": cmd_apply, "deps": cmd_deps, "doctor": cmd_doctor}[args.cmd](args)
+
+if __name__ == "__main__":
+    main()

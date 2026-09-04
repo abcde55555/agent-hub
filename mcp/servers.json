@@ -51,6 +51,9 @@
       "requires": {
         "bins": [
           "clawo-mcp"
+        ],
+        "npm": [
+          "@enderfga/claw-orchestrator"
         ]
       }
     }
