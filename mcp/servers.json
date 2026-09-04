@@ -1,0 +1,67 @@
+{
+  "version": 1,
+  "mcpServers": {
+    "basic-memory": {
+      "targets": {
+        "claude": true,
+        "codex": true,
+        "agy": true,
+        "dsh": false,
+        "opencode": true
+      },
+      "auto": true,
+      "transport": "sse",
+      "url": "https://vm-0-6-ubuntu.tailad41e7.ts.net/mcp"
+    },
+    "browser-agent": {
+      "targets": {
+        "claude": true,
+        "codex": true,
+        "agy": true,
+        "dsh": false,
+        "opencode": true
+      },
+      "auto": true,
+      "transport": "stdio",
+      "requires": {
+        "pip": [
+          "fastmcp",
+          "playwright"
+        ],
+        "system": [
+          "chromium"
+        ]
+      },
+      "command": "${HUB_PYTHON}",
+      "args": [
+        "${HUB_ROOT}/mcp/browser-agent/server.py"
+      ]
+    },
+    "clawo": {
+      "targets": {
+        "claude": true,
+        "codex": true,
+        "agy": true,
+        "dsh": false,
+        "opencode": true
+      },
+      "auto": true,
+      "transport": "stdio",
+      "command": "clawo-mcp",
+      "args": [],
+      "env": {
+        "HTTPS_PROXY": "${HTTPS_PROXY}",
+        "HTTP_PROXY": "${HTTP_PROXY}",
+        "https_proxy": "${https_proxy}",
+        "http_proxy": "${http_proxy}",
+        "NO_PROXY": "localhost,127.0.0.1,::1,192.168.0.0/16",
+        "CLAWO_MCP_TOOLS": "session_start,session_send,session_stop,session_list,session_status,sessions_overview,coding_session_status,coding_agents_list,session_grep,session_compact"
+      },
+      "requires": {
+        "bins": [
+          "clawo-mcp"
+        ]
+      }
+    }
+  }
+}
