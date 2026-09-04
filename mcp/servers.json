@@ -26,7 +26,16 @@
       "command": "${HUB_PYTHON}",
       "args": [
         "${HUB_ROOT}/mcp/browser-agent/server.py"
-      ]
+      ],
+      "requires": {
+        "pip": [
+          "fastmcp",
+          "playwright"
+        ],
+        "system": [
+          "chromium"
+        ]
+      }
     },
     "clawo": {
       "targets": {

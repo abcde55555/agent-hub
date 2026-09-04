@@ -456,15 +456,19 @@ def hub_mcp_from_claude(claude_mcp: dict, dry: bool) -> tuple[dict, list[str], d
                     else:
                         dest_dir.mkdir(parents=True, exist_ok=True)
                         files = gather_local_scripts(ap, dest_dir)
-                        req = detect_pip_requires(dest_dir)
-                        if req:
-                            spec.setdefault("requires", {}).update(req)
                         notes.append(f"gathered {len(files)} script(s) into hub mcp/{name}/: {sorted(files)}")
                     new_args.append(rel)
                 else:
                     new_args.append(a)
             spec["command"] = cmd
             spec["args"] = new_args
+            # detect deps from gathered scripts whether just copied or already hub-resident
+            if not dry:
+                dest_dir = HUB / "mcp" / name
+                if dest_dir.is_dir():
+                    req = detect_pip_requires(dest_dir)
+                    if req:
+                        spec.setdefault("requires", {}).update(req)
             # env: machine-specific values become ${VAR} references
             env = dict(e.get("env") or {})
             for k, v in list(env.items()):
