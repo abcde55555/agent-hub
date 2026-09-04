@@ -2,3 +2,4 @@ secrets.env
 .sync-state.json
 .ingest-backups/
 local.env
+__pycache__/
