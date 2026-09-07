@@ -999,20 +999,133 @@ def mcp_handshake_stdio(spec: dict, timeout=12) -> tuple[bool, str]:
         except Exception:
             p.kill()
 
-def mcp_check_remote(spec: dict, timeout=10) -> tuple[bool, str]:
-    url = spec["url"]
-    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize",
-                       "params": {"protocolVersion": "2024-11-05", "capabilities": {},
-                                  "clientInfo": {"name": "agent-sync-doctor", "version": "0.1"}}}).encode()
-    headers = {"Content-Type": "application/json"}
+INIT_PAYLOAD = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                           "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                                      "clientInfo": {"name": "agent-sync-doctor", "version": "0.2"}}}).encode()
+
+def remote_headers(spec: dict, extra: dict | None = None) -> dict:
+    h = dict(extra or {})
     for k, v in (spec.get("headers") or {}).items():
-        headers[k] = expand_vars(str(v))
-    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+        h[k] = expand_vars(str(v))
+    return h
+
+def jsonrpc_in_text(text: str) -> dict | None:
+    """Extract a JSON-RPC message from either a raw JSON body or an SSE stream chunk."""
     try:
+        d = json.loads(text)
+        if isinstance(d, dict) and d.get("jsonrpc"):
+            return d
+    except (json.JSONDecodeError, ValueError):
+        pass
+    data_lines: list[str] = []
+    for ln in text.splitlines():
+        s = ln.strip()
+        if s.startswith("data:"):
+            data_lines.append(s[5:].strip())
+        elif s == "" and data_lines:
+            try:
+                d = json.loads(" ".join(data_lines))
+                if isinstance(d, dict) and d.get("jsonrpc"):
+                    return d
+            except (json.JSONDecodeError, ValueError):
+                data_lines = []
+    if data_lines:
+        try:
+            d = json.loads(" ".join(data_lines))
+            if isinstance(d, dict) and d.get("jsonrpc"):
+                return d
+        except (json.JSONDecodeError, ValueError):
+            pass
+    return None
+
+def init_result_msg(d: dict) -> tuple[bool, str] | None:
+    if d.get("id") != 1:
+        return None
+    if "result" in d:
+        si = (d["result"].get("serverInfo") or {})
+        return True, f"initialize OK ({si.get('name', '?')} {si.get('version', '')})".rstrip()
+    if "error" in d:
+        return False, f"JSON-RPC error: {d['error'].get('message', '?')}"
+    return None
+
+def mcp_handshake_remote(spec: dict, timeout=15) -> tuple[bool, str]:
+    """Real initialize handshake over streamable-HTTP (POST) or classic SSE (GET)."""
+    from urllib.parse import urljoin
+    url = expand_vars(spec["url"])
+
+    # 1) streamable HTTP: POST initialize directly
+    try:
+        req = urllib.request.Request(url, data=INIT_PAYLOAD, method="POST",
+                                     headers=remote_headers(spec, {"Content-Type": "application/json",
+                                                                   "Accept": "application/json, text/event-stream"}))
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            return True, f"reachable (HTTP {r.status})"
+            raw = r.read(131072).decode("utf-8", "replace")
+            d = jsonrpc_in_text(raw)
+            if d:
+                m = init_result_msg(d)
+                if m:
+                    return m[0], f"{m[1]} via {r.headers.get_content_type()}"
+            return False, f"HTTP {r.status} but no JSON-RPC initialize response"
     except urllib.error.HTTPError as e:
-        return True, f"reachable (HTTP {e.code})"  # server answered; auth/protocol handled by agent
+        raw = e.read(4096).decode("utf-8", "replace")
+        d = jsonrpc_in_text(raw)
+        if d:
+            m = init_result_msg(d)
+            if m:
+                return m
+        if e.code in (401, 403):
+            return False, f"HTTP {e.code}: auth required or token rejected"
+        if e.code != 405:
+            return False, f"HTTP {e.code} {e.reason}"
+        # 405 → classic SSE flow below
+    except urllib.error.URLError as e:
+        return False, f"unreachable: {e.reason}"
+    except Exception as e:
+        return False, f"error: {e}"
+
+    # 2) classic SSE transport: open stream, learn POST endpoint, initialize, await result
+    try:
+        req = urllib.request.Request(url, method="GET",
+                                     headers=remote_headers(spec, {"Accept": "text/event-stream"}))
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            endpoint, event_name = None, None
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                try:
+                    line = r.readline()
+                except TimeoutError:
+                    continue
+                except Exception:
+                    break
+                if not line:
+                    break
+                s = line.decode("utf-8", "replace").strip()
+                if s.startswith("event:"):
+                    event_name = s.split(":", 1)[1].strip()
+                elif s.startswith("data:"):
+                    payload = s.split(":", 1)[1].strip()
+                    if event_name == "endpoint" or (endpoint is None and payload.startswith(("http", "/"))):
+                        endpoint = urljoin(url, payload)
+                        preq = urllib.request.Request(endpoint, data=INIT_PAYLOAD, method="POST",
+                                                      headers=remote_headers(spec, {"Content-Type": "application/json"}))
+                        try:
+                            with urllib.request.urlopen(preq, timeout=timeout) as pr:
+                                pr.read()
+                        except urllib.error.HTTPError as pe:
+                            if pe.code not in (200, 202):
+                                return False, f"SSE endpoint POST returned HTTP {pe.code}"
+                    else:
+                        m = init_result_msg(jsonrpc_in_text(payload) or {})
+                        if m:
+                            return m[0], f"{m[1]} via SSE"
+                    event_name = None
+                elif s == "":
+                    event_name = None
+            return False, "SSE stream opened but no initialize response"
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            return False, f"HTTP {e.code}: auth required or token rejected"
+        return False, f"SSE connect failed: HTTP {e.code} {e.reason}"
     except urllib.error.URLError as e:
         return False, f"unreachable: {e.reason}"
     except Exception as e:
@@ -1034,7 +1147,7 @@ def cmd_doctor(_args):
     handshakes = {}
     for name, spec in servers.items():
         if spec.get("transport") in ("sse", "http"):
-            ok_, msg = mcp_check_remote(spec)
+            ok_, msg = mcp_handshake_remote(spec)
         else:
             ok_, msg = mcp_handshake_stdio(spec)
         handshakes[name] = ok_
