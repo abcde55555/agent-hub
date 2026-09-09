@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "generatedAt": "2026-09-04T18:31:59",
+  "generatedAt": "2026-09-09T09:56:42",
   "skills": [
     "ask-matt",
     "code-review",
@@ -15,6 +15,7 @@
     "implement",
     "improve-codebase-architecture",
     "migrate-to-shoehorn",
+    "orchestrator-init",
     "prototype",
     "research",
     "resolving-merge-conflicts",
