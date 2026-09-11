@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "generatedAt": "2026-09-09T09:56:42",
+  "generatedAt": "2026-09-11T15:51:20",
   "skills": [
     "ask-matt",
     "code-review",
@@ -19,6 +19,7 @@
     "prototype",
     "research",
     "resolving-merge-conflicts",
+    "reverse-engineering",
     "scaffold-exercises",
     "setup-matt-pocock-skills",
     "setup-pre-commit",
