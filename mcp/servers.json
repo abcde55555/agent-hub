@@ -4,11 +4,12 @@
     "basic-memory": {
       "targets": {
         "claude": true,
-        "codex": true,
+        "codex": false,
         "agy": true,
         "dsh": false,
         "opencode": true
       },
+      "_note_codex": "codex 不支持 legacy SSE 传输（POST 得 405）；codex 侧改用本地 mcp-remote stdio 桥接，配置写在 ~/.codex/config.toml managed 区块外，详见该文件注释",
       "auto": true,
       "transport": "sse",
       "url": "https://vm-0-6-ubuntu.tailad41e7.ts.net/mcp"
