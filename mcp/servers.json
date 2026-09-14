@@ -14,30 +14,6 @@
       "transport": "sse",
       "url": "https://vm-0-6-ubuntu.tailad41e7.ts.net/mcp"
     },
-    "browser-agent": {
-      "targets": {
-        "claude": true,
-        "codex": true,
-        "agy": true,
-        "dsh": false,
-        "opencode": true
-      },
-      "auto": true,
-      "transport": "stdio",
-      "command": "${HUB_PYTHON}",
-      "args": [
-        "${HUB_ROOT}/mcp/browser-agent/server.py"
-      ],
-      "requires": {
-        "pip": [
-          "fastmcp",
-          "playwright"
-        ],
-        "system": [
-          "chromium"
-        ]
-      }
-    },
     "clawo": {
       "targets": {
         "claude": true,
@@ -66,6 +42,30 @@
           "@enderfga/claw-orchestrator"
         ]
       }
+    },
+    "browser-use": {
+      "targets": {
+        "claude": true,
+        "codex": true,
+        "agy": true,
+        "dsh": false,
+        "opencode": true
+      },
+      "auto": true,
+      "transport": "stdio",
+      "command": "node",
+      "args": [
+        "${HUB_ROOT}/mcp/browser-use/server.mjs"
+      ],
+      "env": {
+        "BROWSER_HEADLESS": "true"
+      },
+      "requires": {
+        "bins": [
+          "node"
+        ]
+      },
+      "_note_deps": "① 依赖为【本地】安装于 ${HUB_ROOT}/mcp/browser-use/node_modules（在该目录 npm install）；不用 requires.npm —— 那是 npm -g CLI 的锁步字段。② playwright 已在 package.json 中 pin 为 1.62.0（上游写 ^1.50.0）：上游装到 1.63.0 需要 chromium_headless_shell-1243，而本机缓存只有 1234（python playwright 1.62.0 装的）；pin 到 1.62.0 后与 python 侧共用同一份 chromium，省去约 650MB 重复内核。③ BROWSER_HEADLESS=true 默认无头（上游 server.mjs 默认即无头）。④ server.mjs 的 Chrome 探测只认 macOS 路径，Linux 下自动回落到 Playwright 自带 chromium，无需改配置。"
     }
   }
 }

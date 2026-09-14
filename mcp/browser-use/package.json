@@ -1,0 +1,15 @@
+{
+  "name": "standalone-browser-mcp",
+  "version": "1.0.0",
+  "description": "Standalone decoupled Playwright-powered Browser Use MCP server for agy, Claude Code, Cursor, and Trae.",
+  "type": "module",
+  "main": "server.mjs",
+  "bin": {
+    "browser-use-mcp": "./server.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.6.0",
+    "playwright": "1.62.0",
+    "zod": "^3.24.0"
+  }
+}

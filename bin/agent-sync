@@ -622,7 +622,28 @@ def apply_skills(dry, targets):
                 n_created += 1
             elif r == "unchanged":
                 n_unchanged += 1
-        ok(f"{label}: {link_dir}  (+{n_created} new, {n_unchanged} current)")
+        # 清理陈旧软链：ensure_symlink 只增不删，删掉 hub 里的 skill 后会留下断链，
+        # agent 侧仍会看到一个失效条目。只删「指向 hub 且 hub 已无此 skill」的软链；
+        # 实体目录与指向别处的链接一律不碰。
+        live = {p.name for p in HUB_SKILLS.iterdir() if is_skill_dir(p)}
+        n_removed = 0
+        if link_dir.is_dir():
+            for link in sorted(link_dir.iterdir()):
+                if not link.is_symlink() or link.name in live:
+                    continue
+                tgt = Path(os.readlink(link))
+                if not tgt.is_absolute():
+                    tgt = (link.parent / tgt).resolve()
+                try:
+                    tgt.relative_to(HUB_SKILLS.resolve())
+                except ValueError:
+                    continue
+                if not dry:
+                    link.unlink()
+                n_removed += 1
+                warn(f"{link.name}: removed stale skill link")
+        ok(f"{label}: {link_dir}  (+{n_created} new, {n_unchanged} current"
+           + (f", -{n_removed} stale" if n_removed else "") + ")")
     info("dsh/opencode discover ~/.agents/skills natively — no links needed")
 
 def apply_memory(dry, targets):
@@ -641,7 +662,7 @@ def apply_memory(dry, targets):
         r = ensure_symlink(link, HUB_AGENTS_MD, dry=dry)
         ok(f"{label}: {link} ({r})")
 
-def apply_mcp_claude(servers: dict, dry) -> set:
+def apply_mcp_claude(servers: dict, state: dict, dry) -> set:
     head("apply: MCP -> claude ~/.claude.json (merge)")
     managed = set()
     dirty = False
@@ -659,6 +680,15 @@ def apply_mcp_claude(servers: dict, dry) -> set:
             if not dry:
                 mcp[name] = want
             ok(f"{name}: {'would write' if dry else 'written'}")
+    # remove servers we previously managed but hub no longer targets
+    # （与 apply_mcp_agy 同构：claude 侧原先只会增不会减，导致从 hub 下线的
+    #   server 永久残留在 ~/.claude.json —— 多机环境下尤其明显）
+    for gone in set(state.get("claudeManagedMcp") or []) - managed:
+        if gone in mcp:
+            dirty = True
+            if not dry:
+                mcp.pop(gone, None)
+            warn(f"{gone}: removed (no longer in hub targets)")
     if not dry and dirty:
         bak = backup(CLAUDE_JSON)
         write_json(CLAUDE_JSON, cj)
@@ -773,7 +803,7 @@ def cmd_apply(args):
     apply_skills(dry, targets)
     apply_memory(dry, targets)
     state = read_json(HUB_STATE, default={}) or {}
-    claude_managed = apply_mcp_claude(servers, dry) if targets.get("claude") else set()
+    claude_managed = apply_mcp_claude(servers, state, dry) if targets.get("claude") else set()
     codex_managed = apply_mcp_codex(servers, dry) if targets.get("codex") else set()
     agy_managed = apply_mcp_agy(servers, state, dry) if targets.get("agy") else set()
 

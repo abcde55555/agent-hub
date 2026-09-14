@@ -4,3 +4,4 @@ secrets.env
 local.env
 __pycache__/
 .venv/
+node_modules/

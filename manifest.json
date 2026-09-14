@@ -1,8 +1,9 @@
 {
   "version": 1,
-  "generatedAt": "2026-09-11T15:51:20",
+  "generatedAt": "2026-09-14T14:05:57",
   "skills": [
     "ask-matt",
+    "browser-use",
     "code-review",
     "codebase-design",
     "diagnosing-bugs",
@@ -31,13 +32,14 @@
     "triage",
     "wait-what",
     "wayfinder",
+    "web-gui-tester",
     "wizard",
     "writing-for-agents"
   ],
   "mcpServers": [
     "basic-memory",
-    "browser-agent",
-    "clawo"
+    "clawo",
+    "browser-use"
   ],
   "note": "targets/requires live in mcp/servers.json; edit there then run `agent-sync apply`"
 }
