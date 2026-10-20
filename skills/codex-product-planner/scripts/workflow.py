@@ -76,7 +76,17 @@ def init(args):
     root, flow = locations(args)
     config_path = inside(root, flow / "coordination.json")
     if flow.exists() and any(flow.iterdir()) and not config_path.exists():
-        raise ValueError("已有协作目录不是本工具创建的；先映射现有资料或选择其他 workflow-dir")
+        # A display-only project may later enter the development workflow.
+        overview = inside(root, flow / "overview")
+        model_path = inside(root, overview / "model.json")
+        overview_only = (set(p.name for p in flow.iterdir()) == {"overview"}
+                         and overview.is_dir() and not overview.is_symlink()
+                         and model_path.is_file() and not model_path.is_symlink()
+                         and read_json(model_path).get("schema_version") == 1
+                         and all(p.name in {"model.json", "index.html"} and not p.is_symlink()
+                                 for p in overview.iterdir()))
+        if not overview_only:
+            raise ValueError("已有协作目录不是本工具创建的；先映射现有资料或选择其他 workflow-dir")
     if config_path.exists() and read_json(config_path).get("schema_version") != 1:
         raise ValueError("现有协调记录版本不兼容，保留原文件并先确认迁移")
     config = {

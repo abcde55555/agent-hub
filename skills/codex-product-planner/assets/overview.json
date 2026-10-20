@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "name": null,
+  "summary": null,
+  "stage": "unknown",
+  "goal": {"text": null, "confirmed": false, "roadmap_complete": false, "source_refs": []},
+  "basis": {"head_sha": null, "fingerprint": null},
+  "panorama": {"nodes": [], "edges": []},
+  "milestones": [],
+  "technical": [],
+  "gaps": [],
+  "next_steps": [],
+  "sources": [],
+  "task_sources": []
+}
