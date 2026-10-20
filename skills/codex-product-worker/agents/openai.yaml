@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex 产品执行交付"
+  short_description: "按明确任务实现产品功能，自检并提交 Git，留下可复现证据与交接报告"
+  default_prompt: "使用 $codex-product-worker 读取指定任务合同，在分配的工作目录实现、自检、提交并交接。"

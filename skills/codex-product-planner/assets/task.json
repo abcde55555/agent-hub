@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "task_id": null,
+  "revision": 1,
+  "mode": "implement",
+  "ready": false,
+  "title": null,
+  "user_goal": null,
+  "scenario": {"actor": null, "start": null, "actions": [], "expected_result": null},
+  "baseline": {"kind": "git", "base_sha": null, "uncommitted_changes": null, "source_refs": []},
+  "scope": {"write_paths": [], "preserve": [], "exclusions": []},
+  "rules": [],
+  "dependencies": [],
+  "acceptance": [],
+  "verification": {"commands": [], "entrypoint": null, "data_refs": [], "limits": []},
+  "review_target": null
+}

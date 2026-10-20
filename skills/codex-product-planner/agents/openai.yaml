@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex 产品规划协调"
+  short_description: "接手已有项目，梳理业务流程并调度执行聊天，组织集成与真人试用验收"
+  default_prompt: "使用 $codex-product-planner 接手当前项目，核对现状并整理下一项可试用的工作与执行计划。"

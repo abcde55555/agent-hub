@@ -1,11 +1,13 @@
 {
   "version": 1,
-  "generatedAt": "2026-09-14T14:05:57",
+  "generatedAt": "2026-10-20T11:44:53",
   "skills": [
     "ask-matt",
     "browser-use",
     "code-review",
     "codebase-design",
+    "codex-product-planner",
+    "codex-product-worker",
     "diagnosing-bugs",
     "domain-modeling",
     "git-guardrails-claude-code",
