@@ -179,9 +179,27 @@ agent-hub/
 - **多维表格地址**：[查看任务看板](https://my.feishu.cn/base/HWzCbV0cvaKmnvstzXPcuhjGn1b)
 - **工作流机制**：
   1. 在多维表格中录入需求、Bug 或漏洞，并将状态标记为 `待处理`。
-  2. DSH Superagent 实时监听表格事件，自动切出 `agent/bitable-*` 专属工作分支。
+  2. DSH Superagent 定期轮询状态为 `待处理` 的记录，自动切出 `agent/bitable-*` 专属工作分支。
   3. 智能体自动执行代码修改与测试，生成 Pull Request。
   4. 任务完成后，PR 链接与处理结论自动回写至多维表格，并将状态自动更新为 `已完成`。
+
+### 读取自检
+
+任务看板可正常读取。使用用户身份直接读取记录：
+
+```bash
+lark-cli base +record-list \
+  --base-token HWzCbV0cvaKmnvstzXPcuhjGn1b \
+  --table-id tbld5brqD6pEIQ6l \
+  --format json --as user
+```
+
+本次自检读取到 1 张数据表、9 个字段和 2 条记录，任务标题、状态、类型等字段均完整可读。若使用应用（bot）身份且未开通 `base:record:read`，可改用 Bitable v1 原始接口：
+
+```bash
+lark-cli api GET /open-apis/bitable/v1/apps/HWzCbV0cvaKmnvstzXPcuhjGn1b/tables/tbld5brqD6pEIQ6l/records \
+  --params '{"page_size":20}' --as bot
+```
 
 ## 来源与许可
 
