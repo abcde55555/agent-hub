@@ -172,6 +172,26 @@ Add skills under `skills/<name>/SKILL.md` with their scope, workflow, and requir
 
 When reporting an issue, include tool versions, reproduction steps, expected and actual results, and redacted check output. Known gaps and verification limits are listed in the [usage guide](docs/usage.md#使用范围与边界).
 
+## Bitable and the DSH task board
+
+Besides distributing configuration, this repository can also take work from a Bitable: a task is recorded in the table, DSH picks it up and delivers a pull request, and the result is written back to the record.
+
+```mermaid
+flowchart LR
+    Record["Bitable record<br/>Pending"] -->|Dispatch message| DSH["DSH task board"]
+    DSH -->|Branch · commits| PR["Pull request"]
+    DSH -->|PR link · Outcome| Record
+    PR --> Review["Human review and merge"]
+```
+
+1. **Record the task**: fill in the task title, target repository, and description. The type can be 需求 (requirement), Bug, or 漏洞 (vulnerability); keep the status at `待处理` (pending).
+2. **Dispatch**: send the templated message containing the record ID in the group chat. DSH reads the record and adds the task to its board.
+3. **Execute**: DSH creates a task branch in the target repository, makes and checks the changes, and opens a pull request.
+4. **Write back**: when the work is done, the PR link and outcome are written back to the record, and the status becomes `已完成` (done).
+5. **Merge**: a person reviews and merges the PR; DSH never merges its own pull requests.
+
+The table holds only the task and result references: code, checks, and discussion stay in Git and GitHub, while the status moves between `待处理` (pending), `处理中` (in progress), `已完成` (done), and `已取消` (cancelled).
+
 ## Sources and licensing
 
 The repository brings together skills, adaptations, and configuration tooling. Check the source and usage terms of each component separately. There is currently no root `LICENSE` file, so this README does not assign a single open-source license to the whole repository.
