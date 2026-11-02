@@ -172,6 +172,35 @@ agent-hub/
 
 问题反馈请附工具名称与版本、操作步骤、预期与实际结果，以及脱敏后的检查输出。当前仓库快照的已知缺口和验证范围见 [使用范围与边界](docs/usage.md#使用范围与边界)。
 
+## 飞书多维表格（Bitable）自动化流转
+
+本项目已接入飞书多维表格与 DSH Superagent 自动化联动。
+
+- **多维表格地址**：[查看任务看板](https://my.feishu.cn/base/HWzCbV0cvaKmnvstzXPcuhjGn1b)
+- **工作流机制**：
+  1. 在多维表格中录入需求、Bug 或漏洞，并将状态标记为 `待处理`。
+  2. DSH Superagent 定期轮询状态为 `待处理` 的记录，自动切出 `agent/bitable-*` 专属工作分支。
+  3. 智能体自动执行代码修改与测试，生成 Pull Request。
+  4. 任务完成后，PR 链接与处理结论自动回写至多维表格，并将状态自动更新为 `已完成`。
+
+### 读取自检
+
+任务看板可正常读取。使用用户身份直接读取记录：
+
+```bash
+lark-cli base +record-list \
+  --base-token HWzCbV0cvaKmnvstzXPcuhjGn1b \
+  --table-id tbld5brqD6pEIQ6l \
+  --format json --as user
+```
+
+本次自检读取到 1 张数据表、9 个字段和 2 条记录，任务标题、状态、类型等字段均完整可读。若使用应用（bot）身份且未开通 `base:record:read`，可改用 Bitable v1 原始接口：
+
+```bash
+lark-cli api GET /open-apis/bitable/v1/apps/HWzCbV0cvaKmnvstzXPcuhjGn1b/tables/tbld5brqD6pEIQ6l/records \
+  --params '{"page_size":20}' --as bot
+```
+
 ## 来源与许可
 
 本仓库汇集技能、适配内容与配置工具，各项内容的来源和使用条件应分别核对。当前根目录尚无统一 `LICENSE`，这里不声明仓库整体采用某一开源许可证。
